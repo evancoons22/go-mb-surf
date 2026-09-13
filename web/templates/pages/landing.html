@@ -25,12 +25,14 @@
         /* Hero buttons are a size up from the app-wide 32px control height. */
         .cta-button, .ghost-button { height: 36px; padding: 0 16px; font-size: 13px; }
 
-        /* --- Synoptic chart background ------------------------------------
-           An animated contour field, like the swell-height charts on the map
-           page: nested rings around two systems, undulating slowly. The SVG
-           sits behind the hero; a radial shade keeps the text readable. */
+        /* --- Model raster background ---------------------------------------
+           A quantized swell-height heatmap: a fine grid of cells coloured by
+           a noisy field that steps forward in discrete ticks, like a wave
+           model run. The canvas sits behind the hero, the SVG graticule sits
+           on top of it, and a radial shade keeps the text readable. */
         .chart-field { position: absolute; inset: 0; overflow: hidden; }
-        .chart-field svg { width: 100%; height: 100%; display: block; }
+        .chart-field canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+        .chart-field svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
         .hero-shade {
             position: absolute; inset: 0;
             background: radial-gradient(ellipse 58% 52% at 50% 44%, rgba(14, 15, 18, 0.9) 0%, rgba(14, 15, 18, 0.5) 55%, transparent 78%);
@@ -72,9 +74,9 @@
     <!-- Hero over the chart field -->
     <main class="flex-grow relative flex flex-col items-center justify-center px-6 py-16">
         <div class="chart-field" aria-hidden="true">
+            <canvas id="heatmap"></canvas>
             <svg id="contourChart" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid slice">
                 <g id="graticule"></g>
-                <g id="contours" stroke-linejoin="round"></g>
             </svg>
             <div class="hero-shade"></div>
             <div class="chart-note" style="left: 18px; bottom: 14px;">GFS-WAVE &middot; 0.25&deg; &middot; SIG. HEIGHT (M)</div>
@@ -147,15 +149,6 @@
         // Same ramp as the map legend (low to high swell)
         const RAMP = ['#64a8e8', '#3178d2', '#15a3a3', '#2fb54e', '#a3c520', '#f2ce08'];
 
-        // Each system is a set of nested contour rings that share one radial
-        // wobble, so rings scale together and never cross.
-        const systems = [
-            { cx: 320,  cy: 250, maxR: 320, rings: 6, p: [0.8, 2.1, 4.0], s: [0.10, 0.16, 0.07] },
-            { cx: 1300, cy: 580, maxR: 400, rings: 7, p: [3.1, 0.4, 1.7], s: [0.08, 0.13, 0.05] },
-            { cx: 780,  cy: 960, maxR: 300, rings: 5, p: [5.2, 1.2, 2.9], s: [0.12, 0.09, 0.06] },
-            { cx: 1490, cy: 90,  maxR: 170, rings: 3, p: [1.9, 4.4, 0.2], s: [0.09, 0.14, 0.08] },
-        ];
-
         // Graticule: faint 2° grid with coordinate ticks
         const grat = document.getElementById('graticule');
         for (let x = 160; x < W; x += 160) {
@@ -191,70 +184,128 @@
             grat.appendChild(t);
         }
 
-        // Build one <path> per ring. Outermost rings are appended first so
-        // each nested ring's translucent fill stacks on top of the last,
-        // shading the field progressively toward the center of each system.
-        const contours = document.getElementById('contours');
-        for (const sys of systems) {
-            sys.paths = [];
-            for (let k = sys.rings - 1; k >= 0; k--) {
-                const path = document.createElementNS(SVG_NS, 'path');
-                // innermost ring = highest swell = warmest color in the ramp
-                const color = RAMP[Math.min(RAMP.length - 1, sys.rings - 1 - k)];
-                path.setAttribute('stroke', color);
-                path.setAttribute('stroke-width', 1);
-                path.setAttribute('stroke-opacity', (0.4 - k * 0.04).toFixed(2));
-                path.setAttribute('fill', color);
-                path.setAttribute('fill-opacity', '0.055');
-                if (k % 2 === 1) path.setAttribute('stroke-dasharray', '5 7');
-                contours.appendChild(path);
-                sys.paths[k] = path;
-            }
-        }
+        // --- Heatmap raster ------------------------------------------------
+        const canvas = document.getElementById('heatmap');
+        const ctx = canvas.getContext('2d');
+        const CELL = 10, GAP = 1, TICK_MS = 200;
+        // Fraction of cells allowed to catch up to the field on each tick. Small,
+        // so changes trickle across the page instead of flipping all at once.
+        const UPDATE_FRAC = 0.03;
+        // Uneven thresholds: warm colours are rare, most of the field is dark or blue.
+        const LEVELS = [0.22, 0.36, 0.50, 0.64, 0.78, 0.92];
+        const ALPHA = [0.10, 0.14, 0.18, 0.22, 0.26, 0.30];
 
-        const N = 44; // points per ring
-        function ringPath(sys, k, t) {
-            const r = sys.maxR * (k + 1) / sys.rings;
-            const pts = [];
-            for (let i = 0; i < N; i++) {
-                const th = (i / N) * Math.PI * 2;
-                const w = 1
-                    + 0.13 * Math.sin(3 * th + sys.p[0] + t * sys.s[0])
-                    + 0.07 * Math.sin(5 * th - sys.p[1] + t * sys.s[1])
-                    + 0.05 * Math.sin(2 * th + sys.p[2] - t * sys.s[2]);
-                pts.push([sys.cx + r * w * Math.cos(th), sys.cy + r * w * Math.sin(th)]);
-            }
-            // closed Catmull-Rom -> cubic bezier for smooth contours
-            let d = `M ${pts[0][0].toFixed(1)} ${pts[0][1].toFixed(1)}`;
-            for (let i = 0; i < N; i++) {
-                const p0 = pts[(i - 1 + N) % N], p1 = pts[i], p2 = pts[(i + 1) % N], p3 = pts[(i + 2) % N];
-                const c1x = p1[0] + (p2[0] - p0[0]) / 6, c1y = p1[1] + (p2[1] - p0[1]) / 6;
-                const c2x = p2[0] - (p3[0] - p1[0]) / 6, c2y = p2[1] - (p3[1] - p1[1]) / 6;
-                d += ` C ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${c2x.toFixed(1)} ${c2y.toFixed(1)}, ${p2[0].toFixed(1)} ${p2[1].toFixed(1)}`;
-            }
-            return d + ' Z';
-        }
+        // Swell systems: gaussian blobs whose centres wander on slow
+        // Lissajous paths. Positions are in [0,1] field space; the middle of
+        // the field is left empty so the hero text stays readable.
+        const systems = [
+            { x: 0.20, y: 0.28, r: 0.26, a: 1.00, fx: 0.017, fy: 0.023, ph: 0.8, ax: 0.05, ay: 0.04 },
+            { x: 0.82, y: 0.66, r: 0.30, a: 1.05, fx: 0.013, fy: 0.019, ph: 3.1, ax: 0.06, ay: 0.05 },
+            { x: 0.50, y: 1.06, r: 0.22, a: 0.80, fx: 0.021, fy: 0.011, ph: 5.2, ax: 0.07, ay: 0.03 },
+            { x: 0.93, y: 0.08, r: 0.14, a: 0.75, fx: 0.019, fy: 0.027, ph: 1.9, ax: 0.03, ay: 0.03 },
+        ];
 
-        function draw(t) {
-            for (const sys of systems) {
-                for (let k = 0; k < sys.rings; k++) {
-                    sys.paths[k].setAttribute('d', ringPath(sys, k, t));
+        // Integer hash -> [0,1). Cheap, deterministic, good enough for value noise.
+        function hash(x, y, z) {
+            let h = (x * 374761393 + y * 668265263 + z * 2147483647) | 0;
+            h = Math.imul(h ^ (h >>> 13), 1274126177);
+            return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+        }
+        const smooth = (t) => t * t * (3 - 2 * t);
+        // Trilinear value noise over (x, y, time).
+        function noise(x, y, z) {
+            const x0 = Math.floor(x), y0 = Math.floor(y), z0 = Math.floor(z);
+            const fx = smooth(x - x0), fy = smooth(y - y0), fz = smooth(z - z0);
+            let v = 0;
+            for (let dz = 0; dz < 2; dz++) {
+                const wz = dz ? fz : 1 - fz;
+                for (let dy = 0; dy < 2; dy++) {
+                    const wy = dy ? fy : 1 - fy;
+                    for (let dx = 0; dx < 2; dx++) {
+                        const wx = dx ? fx : 1 - fx;
+                        v += hash(x0 + dx, y0 + dy, z0 + dz) * wx * wy * wz;
+                    }
                 }
             }
+            return v;
         }
 
-        draw(0);
+        // Field space is measured in units of the shorter canvas side, so the
+        // systems keep their size on tall phone viewports too.
+        let cols = 0, rows = 0, sx = 1, sy = 1;
+        let levels = null; // persistent per-cell level, -1 = empty, -2 = never set
+        function resize() {
+            const dpr = window.devicePixelRatio || 1;
+            const w = canvas.clientWidth, h = canvas.clientHeight;
+            canvas.width = Math.round(w * dpr);
+            canvas.height = Math.round(h * dpr);
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            cols = Math.ceil(w / CELL);
+            rows = Math.ceil(h / CELL);
+            const unit = Math.max(1, Math.min(w, h));
+            sx = w / unit; sy = h / unit;
+            levels = new Int8Array(cols * rows).fill(-2);
+        }
+
+        function draw(tick) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            const t = tick * 0.005, nt = tick / 24;
+            const buckets = LEVELS.map(() => []);
+            for (let j = 0; j < rows; j++) {
+                const v = (j + 0.5) / rows * sy;
+                for (let i = 0; i < cols; i++) {
+                    const u = (i + 0.5) / cols * sx;
+                    let f = 0;
+                    for (const s of systems) {
+                        const cx = (s.x + s.ax * Math.sin(t * s.fx * 60 + s.ph)) * sx;
+                        const cy = (s.y + s.ay * Math.cos(t * s.fy * 60 + s.ph * 0.7)) * sy;
+                        const dx = u - cx, dy = v - cy;
+                        f += s.a * Math.exp(-(dx * dx + dy * dy) / (2 * s.r * s.r));
+                    }
+                    // Two octaves of drifting noise roughen the band edges, and a
+                    // static per-cell jitter keeps them from ever forming clean curves.
+                    f += 0.18 * (noise(i / 8, j / 8, nt) - 0.5) * 2;
+                    f += 0.08 * (noise(i / 3 + 37, j / 3 + 11, nt * 1.5) - 0.5) * 2;
+                    f += 0.03 * (hash(i, j, 991) - 0.5) * 2;
+                    let target = -1;
+                    for (let k = LEVELS.length - 1; k >= 0; k--) { if (f >= LEVELS[k]) { target = k; break; } }
+                    const idx = j * cols + i;
+                    // Only a random handful of cells update per tick; the rest keep
+                    // their last value until their turn comes round.
+                    if (levels[idx] === -2 || hash(i, j, tick + 7919) < UPDATE_FRAC) levels[idx] = target;
+                    const lvl = levels[idx];
+                    if (lvl >= 0) buckets[lvl].push(i, j);
+                }
+            }
+            for (let k = 0; k < LEVELS.length; k++) {
+                const b = buckets[k];
+                if (!b.length) continue;
+                ctx.fillStyle = RAMP[k];
+                ctx.globalAlpha = ALPHA[k];
+                for (let n = 0; n < b.length; n += 2) {
+                    ctx.fillRect(b[n] * CELL, b[n + 1] * CELL, CELL - GAP, CELL - GAP);
+                }
+            }
+            ctx.globalAlpha = 1;
+        }
+
+        let tick = 0;
+        resize();
+        draw(tick);
+
+        let resizeTimer = 0;
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => { resize(); draw(tick); }, 120);
+        });
+
         if (!reduceMotion) {
-            let last = 0;
-            function frame(ms) {
-                // ~30fps is plenty for slow-moving contours
-                if (ms - last > 33) {
-                    last = ms;
-                    draw(ms / 1000);
-                }
-                requestAnimationFrame(frame);
-            }
-            requestAnimationFrame(frame);
+            // The field drifts slowly; each tick a few random cells catch up to it.
+            setInterval(() => {
+                if (document.hidden) return;
+                tick++;
+                draw(tick);
+            }, TICK_MS);
         }
     })();
     </script>
